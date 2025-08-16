@@ -312,3 +312,355 @@
   )
 )
 
+;; Issue certificate with template
+(define-public (issue-certificate-with-template
+  (template-id uint)
+  (student-address principal)
+  (certificate-hash (buff 32))
+  (degree-type (string-ascii 50))
+  (field-of-study (string-ascii 100))
+  (graduation-date uint)
+  (metadata-uri (optional (string-ascii 200)))
+)
+  (begin
+    (asserts! (validate-certificate-template template-id) ERR-TEMPLATE-NOT-FOUND)
+    (issue-certificate student-address certificate-hash degree-type field-of-study graduation-date metadata-uri)
+  )
+)
+
+;; Batch issue certificates
+(define-public (batch-issue-certificates
+  (certificates-data (list 10 {
+    student-address: principal,
+    certificate-hash: (buff 32),
+    degree-type: (string-ascii 50),
+    field-of-study: (string-ascii 100),
+    graduation-date: uint,
+    metadata-uri: (optional (string-ascii 200))
+  }))
+)
+  (begin
+    (asserts! (is-authorized-institution tx-sender) ERR-INVALID-INSTITUTION)
+    (asserts! (<= (len certificates-data) u10) ERR-BATCH-LIMIT-EXCEEDED)
+    
+    (ok (map batch-issue-single certificates-data))
+  )
+)
+
+;; Add certificate grades
+(define-public (add-certificate-grades
+  (cert-id uint)
+  (gpa (optional uint))
+  (honors (optional (string-ascii 50)))
+  (rank (optional uint))
+  (total-credits (optional uint))
+  (distinctions (list 5 (string-ascii 100)))
+)
+  (begin
+    (match (map-get? certificates cert-id)
+      certificate-data
+        (begin
+          (asserts! (is-eq tx-sender (get institution certificate-data)) ERR-NOT-AUTHORIZED)
+          (match gpa
+            some-gpa (asserts! (validate-gpa some-gpa) ERR-INVALID-GRADE)
+            true
+          )
+          
+          (map-set certificate-grades cert-id {
+            gpa: gpa,
+            honors: honors,
+            rank: rank,
+            total-credits: total-credits,
+            distinctions: distinctions
+          })
+          (ok true)
+        )
+      ERR-NOT-FOUND
+    )
+  )
+)
+
+;; Grant certificate access
+(define-public (grant-certificate-access
+  (cert-id uint)
+  (viewer principal)
+  (access-level (string-ascii 20))
+  (expires-at (optional uint))
+)
+  (begin
+    (match (map-get? certificates cert-id)
+      certificate-data
+        (begin
+          (asserts! (is-eq tx-sender (get student-address certificate-data)) ERR-NOT-AUTHORIZED)
+          
+          (map-set certificate-sharing 
+            {certificate-id: cert-id, viewer: viewer}
+            {
+              granted-by: tx-sender,
+              access-level: access-level,
+              granted-at: block-height,
+              expires-at: expires-at
+            }
+          )
+          (ok true)
+        )
+      ERR-NOT-FOUND
+    )
+  )
+)
+
+;; Revoke certificate access
+(define-public (revoke-certificate-access (cert-id uint) (viewer principal))
+  (begin
+    (match (map-get? certificates cert-id)
+      certificate-data
+        (begin
+          (asserts! (is-eq tx-sender (get student-address certificate-data)) ERR-NOT-AUTHORIZED)
+          (map-delete certificate-sharing {certificate-id: cert-id, viewer: viewer})
+          (ok true)
+        )
+      ERR-NOT-FOUND
+    )
+  )
+)
+
+;; Add endorsement to certificate
+(define-public (endorse-certificate (cert-id uint))
+  (begin
+    (asserts! (is-authorized-institution tx-sender) ERR-INVALID-INSTITUTION)
+    (match (map-get? certificates cert-id)
+      certificate-data
+        (let ((current-endorsements (default-to 
+          {endorsers: (list), endorsement-count: u0, required-endorsements: u3, is-fully-endorsed: false}
+          (map-get? certificate-endorsements cert-id)
+        )))
+          (let ((new-endorsers (unwrap! (as-max-len? (append (get endorsers current-endorsements) tx-sender) u10) ERR-BATCH-LIMIT-EXCEEDED))
+                (new-count (+ (get endorsement-count current-endorsements) u1)))
+            (map-set certificate-endorsements cert-id {
+              endorsers: new-endorsers,
+              endorsement-count: new-count,
+              required-endorsements: (get required-endorsements current-endorsements),
+              is-fully-endorsed: (>= new-count (get required-endorsements current-endorsements))
+            })
+            (ok true)
+          )
+        )
+      ERR-NOT-FOUND
+    )
+  )
+)
+
+;; Set institution verification level (only contract owner)
+(define-public (set-institution-verification
+  (institution principal)
+  (verification-level uint)
+  (accreditation-bodies (list 3 (string-ascii 100)))
+)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (and (>= verification-level u1) (<= verification-level u5)) ERR-INVALID-INSTITUTION)
+    
+    (map-set institution-verification institution {
+      verification-level: verification-level,
+      verified-by: (list),
+      verification-date: block-height,
+      accreditation-bodies: accreditation-bodies
+    })
+    (ok true)
+  )
+)
+
+;; ============================================================================
+;; ENHANCED DATA STRUCTURES
+;; ============================================================================
+
+;; Certificate Templates System
+(define-map certificate-templates 
+  uint ;; template-id
+  {
+    name: (string-ascii 100),
+    institution: principal,
+    required-fields: (list 10 (string-ascii 50)),
+    validation-rules: (string-ascii 500),
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+;; Endorsements and Multi-Signature Verification
+(define-map certificate-endorsements
+  uint ;; certificate-id
+  {
+    endorsers: (list 10 principal),
+    endorsement-count: uint,
+    required-endorsements: uint,
+    is-fully-endorsed: bool
+  }
+)
+
+;; Certificate sharing and access control
+(define-map certificate-sharing
+  {certificate-id: uint, viewer: principal}
+  {
+    granted-by: principal,
+    access-level: (string-ascii 20), ;; "view", "verify", "full"
+    granted-at: uint,
+    expires-at: (optional uint)
+  }
+)
+
+;; Certificate grades and achievements
+(define-map certificate-grades
+  uint ;; certificate-id
+  {
+    gpa: (optional uint), ;; multiplied by 100 for precision (e.g., 350 = 3.50)
+    honors: (optional (string-ascii 50)),
+    rank: (optional uint),
+    total-credits: (optional uint),
+    distinctions: (list 5 (string-ascii 100))
+  }
+)
+
+;; Institution verification levels
+(define-map institution-verification
+  principal
+  {
+    verification-level: uint, ;; 1-5 scale
+    verified-by: (list 5 principal),
+    verification-date: uint,
+    accreditation-bodies: (list 3 (string-ascii 100))
+  }
+)
+
+;; Contract statistics
+(define-data-var total-institutions uint u0)
+(define-data-var total-verified-certificates uint u0)
+(define-data-var total-revoked-certificates uint u0)
+(define-data-var template-counter uint u0)
+
+;; Enhanced error constants
+(define-constant ERR-TEMPLATE-NOT-FOUND (err u106))
+(define-constant ERR-INSUFFICIENT-ENDORSEMENTS (err u107))
+(define-constant ERR-ACCESS-DENIED (err u108))
+(define-constant ERR-EXPIRED-ACCESS (err u109))
+(define-constant ERR-INVALID-GRADE (err u110))
+(define-constant ERR-BATCH-LIMIT-EXCEEDED (err u111))
+
+;; ============================================================================
+;; ENHANCED READ-ONLY FUNCTIONS
+;; ============================================================================
+
+;; Get certificate with all details
+(define-read-only (get-certificate-full-details (cert-id uint))
+  (match (map-get? certificates cert-id)
+    certificate-data
+      (ok {
+        certificate: certificate-data,
+        grades: (map-get? certificate-grades cert-id),
+        endorsements: (map-get? certificate-endorsements cert-id),
+        institution-info: (map-get? authorized-institutions (get institution certificate-data)),
+        institution-verification: (map-get? institution-verification (get institution certificate-data))
+      })
+    ERR-NOT-FOUND
+  )
+)
+
+;; Verify certificate with access control
+(define-read-only (verify-certificate-with-access (cert-id uint) (viewer principal))
+  (begin
+    (asserts! (check-certificate-access cert-id viewer) ERR-ACCESS-DENIED)
+    (verify-certificate cert-id)
+  )
+)
+
+;; Get contract analytics
+(define-read-only (get-contract-analytics)
+  {
+    total-certificates: (var-get certificate-counter),
+    total-institutions: (var-get total-institutions),
+    total-verified: (var-get total-verified-certificates),
+    total-revoked: (var-get total-revoked-certificates),
+    total-templates: (var-get template-counter)
+  }
+)
+
+;; Get certificate template
+(define-read-only (get-certificate-template (template-id uint))
+  (map-get? certificate-templates template-id)
+)
+
+;; Get institution verification details
+(define-read-only (get-institution-verification-details (institution principal))
+  (map-get? institution-verification institution)
+)
+
+;; Get certificate sharing info
+(define-read-only (get-certificate-sharing (cert-id uint) (viewer principal))
+  (map-get? certificate-sharing {certificate-id: cert-id, viewer: viewer})
+)
+
+;; Batch verify certificates
+(define-read-only (batch-verify-certificates (cert-ids (list 10 uint)))
+  (map verify-certificate cert-ids)
+)
+
+;; Get certificate grades
+(define-read-only (get-certificate-grades (cert-id uint))
+  (map-get? certificate-grades cert-id)
+)
+
+;; Get certificate endorsements
+(define-read-only (get-certificate-endorsements (cert-id uint))
+  (map-get? certificate-endorsements cert-id)
+)
+
+;; Check if certificate is fully endorsed
+(define-read-only (is-certificate-fully-endorsed (cert-id uint))
+  (match (map-get? certificate-endorsements cert-id)
+    endorsement-data (get is-fully-endorsed endorsement-data)
+    false
+  )
+)
+
+;; Advanced certificate verification with endorsement check
+(define-read-only (verify-certificate-advanced (cert-id uint))
+  (match (map-get? certificates cert-id)
+    certificate-data
+      (let ((endorsements (map-get? certificate-endorsements cert-id))
+            (inst-verification-data (map-get? institution-verification (get institution certificate-data))))
+        (ok {
+          is-valid: (not (get is-revoked certificate-data)),
+          certificate: certificate-data,
+          institution-info: (map-get? authorized-institutions (get institution certificate-data)),
+          endorsements: endorsements,
+          institution-verification: inst-verification-data,
+          verification-score: (calculate-verification-score cert-id)
+        })
+      )
+    ERR-NOT-FOUND
+  )
+)
+
+;; Calculate verification score based on endorsements and institution level
+(define-read-only (calculate-verification-score (cert-id uint))
+  (let ((endorsements (map-get? certificate-endorsements cert-id))
+        (certificate-data (map-get? certificates cert-id)))
+    (match endorsements
+      endorsement-data
+        (let ((endorsement-score (* (get endorsement-count endorsement-data) u10)))
+          (match certificate-data
+            cert-data
+              (let ((inst-verification-data (map-get? institution-verification (get institution cert-data))))
+                (match inst-verification-data
+                  inst-verification
+                    (+ endorsement-score (* (get verification-level inst-verification) u20))
+                  endorsement-score
+                )
+              )
+            u0
+          )
+        )
+      u0
+    )
+  )
+)
