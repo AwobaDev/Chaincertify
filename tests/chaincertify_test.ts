@@ -1444,3 +1444,605 @@ Clarinet.test({
         verification2["is-valid"].expectBool(true);
     },
 });
+
+Clarinet.test({
+    name: "Edge cases - maximum field lengths and boundary conditions",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const university = accounts.get("wallet_1")!;
+        const student = accounts.get("wallet_2")!;
+        
+        // Register institution first
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "register-institution",
+                [
+                    types.principal(university.address),
+                    // Maximum length name (100 characters)
+                    types.ascii("A".repeat(100)),
+                    // Maximum length accreditation-id (50 characters)
+                    types.ascii("B".repeat(50))
+                ],
+                deployer.address
+            )
+        ]);
+        block.receipts[0].result.expectOk().expectBool(true);
+        
+        // Issue certificate with maximum field lengths
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "issue-certificate",
+                [
+                    types.principal(student.address),
+                    types.buff(new Uint8Array(32).fill(255)), // Max buffer values
+                    types.ascii("C".repeat(50)), // Max degree type length
+                    types.ascii("D".repeat(100)), // Max field of study length
+                    types.uint(4294967295), // Max uint value for graduation date
+                    types.some(types.ascii("E".repeat(200))) // Max metadata URI length
+                ],
+                university.address
+            )
+        ]);
+        
+        const certificateId = block.receipts[0].result.expectOk().expectUint(1);
+        
+        // Verify certificate was created successfully
+        let call = await chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "verify-certificate",
+            [types.uint(certificateId)],
+            deployer.address
+        );
+        
+        const verification = call.result.expectOk().expectTuple() as any;
+        verification["is-valid"].expectBool(true);
+        const certificate = verification["certificate"].expectTuple() as any;
+        certificate["is-revoked"].expectBool(false);
+        certificate["degree-type"].expectAscii("C".repeat(50));
+        certificate["field-of-study"].expectAscii("D".repeat(100));
+    },
+});
+
+Clarinet.test({
+    name: "Security tests - unauthorized access and permission validation",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const university = accounts.get("wallet_1")!;
+        const maliciousUser = accounts.get("wallet_2")!;
+        const student = accounts.get("wallet_3")!;
+        
+        // Register institution
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "register-institution",
+                [
+                    types.principal(university.address),
+                    types.ascii("Security Test University"),
+                    types.ascii("STU2023")
+                ],
+                deployer.address
+            )
+        ]);
+        block.receipts[0].result.expectOk().expectBool(true);
+        
+        // Issue a certificate
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "issue-certificate",
+                [
+                    types.principal(student.address),
+                    types.buff(new Uint8Array(32).fill(42)),
+                    types.ascii("Security Degree"),
+                    types.ascii("Cybersecurity"),
+                    types.uint(20231215),
+                    types.none()
+                ],
+                university.address
+            )
+        ]);
+        
+        const certificateId = block.receipts[0].result.expectOk().expectUint(1);
+        
+        // Test unauthorized certificate revocation
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "revoke-certificate",
+                [types.uint(certificateId)],
+                maliciousUser.address // Unauthorized user
+            )
+        ]);
+        
+        // Should fail - only issuing institution can revoke
+        block.receipts[0].result.expectErr().expectUint(100);
+        
+        // Test unauthorized institution deactivation
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "deactivate-institution",
+                [types.principal(university.address)],
+                maliciousUser.address // Unauthorized user
+            )
+        ]);
+        
+        // Should fail - only contract owner can deactivate institutions
+        block.receipts[0].result.expectErr().expectUint(100);
+        
+        // Test unauthorized certificate grades addition
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "add-certificate-grades",
+                [
+                    types.uint(certificateId),
+                    types.some(types.uint(400)),
+                    types.some(types.ascii("Summa Cum Laude")),
+                    types.some(types.uint(1)),
+                    types.some(types.uint(150)),
+                    types.list([types.ascii("Valedictorian")])
+                ],
+                maliciousUser.address // Unauthorized user
+            )
+        ]);
+        
+        // Should fail - only issuing institution can add grades
+        block.receipts[0].result.expectErr().expectUint(100);
+        
+        // Test unauthorized template creation
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-certificate-template",
+                [
+                    types.ascii("Malicious Template"),
+                    types.list([types.ascii("fake-field")]),
+                    types.ascii("No validation")
+                ],
+                maliciousUser.address // Unauthorized user
+            )
+        ]);
+        
+        // Should fail - only contract owner can create templates
+        block.receipts[0].result.expectErr().expectUint(103);
+    },
+});
+
+Clarinet.test({
+    name: "Performance and stress tests - multiple operations in single block",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const university1 = accounts.get("wallet_1")!;
+        const university2 = accounts.get("wallet_2")!;
+        const university3 = accounts.get("wallet_3")!;
+        const students = [
+            accounts.get("wallet_4")!,
+            accounts.get("wallet_5")!,
+            accounts.get("wallet_6")!,
+            accounts.get("wallet_7")!,
+            accounts.get("wallet_8")!
+        ];
+        
+        // Register multiple institutions in single block
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "register-institution",
+                [
+                    types.principal(university1.address),
+                    types.ascii("Performance Test University 1"),
+                    types.ascii("PTU001")
+                ],
+                deployer.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "register-institution",
+                [
+                    types.principal(university2.address),
+                    types.ascii("Performance Test University 2"),
+                    types.ascii("PTU002")
+                ],
+                deployer.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "register-institution",
+                [
+                    types.principal(university3.address),
+                    types.ascii("Performance Test University 3"),
+                    types.ascii("PTU003")
+                ],
+                deployer.address
+            )
+        ]);
+        
+        // All registrations should succeed
+        block.receipts[0].result.expectOk().expectBool(true);
+        block.receipts[1].result.expectOk().expectBool(true);
+        block.receipts[2].result.expectOk().expectBool(true);
+        
+        // Issue multiple certificates in single block
+        const degreeTypes = ["Bachelor", "Master", "PhD", "Certificate", "Diploma"];
+        const fields = ["Engineering", "Medicine", "Law", "Arts", "Sciences"];
+        
+        const issueTxs = students.map((student, index) => {
+            const university = [university1, university2, university3][index % 3];
+            return Tx.contractCall(
+                CONTRACT_NAME,
+                "issue-certificate",
+                [
+                    types.principal(student.address),
+                    types.buff(new Uint8Array(32).fill(index + 10)),
+                    types.ascii(degreeTypes[index % degreeTypes.length]),
+                    types.ascii(fields[index % fields.length]),
+                    types.uint(20231201 + index),
+                    types.some(types.ascii(`metadata-${index}`))
+                ],
+                university.address
+            );
+        });
+        
+        block = chain.mineBlock(issueTxs);
+        
+        // All certificate issuances should succeed
+        for (let i = 0; i < students.length; i++) {
+            block.receipts[i].result.expectOk().expectUint(i + 1);
+        }
+        
+        // Verify all certificates are valid
+        for (let i = 1; i <= students.length; i++) {
+            let call = await chain.callReadOnlyFn(
+                CONTRACT_NAME,
+                "verify-certificate",
+                [types.uint(i)],
+                deployer.address
+            );
+            
+            const verification = call.result.expectOk().expectTuple() as any;
+            verification["is-valid"].expectBool(true);
+            const certificate = verification["certificate"].expectTuple() as any;
+            certificate["is-revoked"].expectBool(false);
+        }
+    },
+});
+
+Clarinet.test({
+    name: "Data integrity and consistency tests",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const university = accounts.get("wallet_1")!;
+        const student = accounts.get("wallet_2")!;
+        
+        // Register institution
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "register-institution",
+                [
+                    types.principal(university.address),
+                    types.ascii("Data Integrity University"),
+                    types.ascii("DIU2023")
+                ],
+                deployer.address
+            )
+        ]);
+        block.receipts[0].result.expectOk().expectBool(true);
+        
+        // Issue certificate
+        const originalHash = new Uint8Array(32);
+        originalHash[0] = 0xAB;
+        originalHash[31] = 0xCD;
+        
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "issue-certificate",
+                [
+                    types.principal(student.address),
+                    types.buff(originalHash),
+                    types.ascii("Data Science"),
+                    types.ascii("Computer Science"),
+                    types.uint(20231220),
+                    types.some(types.ascii("integrity-test-metadata"))
+                ],
+                university.address
+            )
+        ]);
+        
+        const certificateId = block.receipts[0].result.expectOk().expectUint(1);
+        
+        // Verify certificate hash integrity
+        let call = await chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "verify-certificate-hash",
+            [types.uint(certificateId), types.buff(originalHash)],
+            deployer.address
+        );
+        
+        const hashValidation = call.result.expectOk().expectTuple() as any;
+        hashValidation["hash-matches"].expectBool(true);
+        
+        // Test with incorrect hash
+        const incorrectHash = new Uint8Array(32);
+        incorrectHash[0] = 0xFF;
+        
+        call = await chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "verify-certificate-hash",
+            [types.uint(certificateId), types.buff(incorrectHash)],
+            deployer.address
+        );
+        
+        const badHashValidation = call.result.expectOk().expectTuple() as any;
+        badHashValidation["hash-matches"].expectBool(false);
+        
+        // Test student certificate count consistency
+        call = await chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-student-certificate-count",
+            [types.principal(student.address)],
+            deployer.address
+        );
+        
+        call.result.expectUint(1);
+        
+        // Test institution certificate count consistency
+        call = await chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-institution-certificate-count",
+            [types.principal(university.address)],
+            deployer.address
+        );
+        
+        call.result.expectUint(1);
+        
+        // Issue another certificate and verify counts increment
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "issue-certificate",
+                [
+                    types.principal(student.address),
+                    types.buff(new Uint8Array(32).fill(99)),
+                    types.ascii("Advanced Data Science"),
+                    types.ascii("Artificial Intelligence"),
+                    types.uint(20231225),
+                    types.none()
+                ],
+                university.address
+            )
+        ]);
+        
+        block.receipts[0].result.expectOk().expectUint(2);
+        
+        // Verify updated counts
+        call = await chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-student-certificate-count",
+            [types.principal(student.address)],
+            deployer.address
+        );
+        
+        call.result.expectUint(2);
+        
+        call = await chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-institution-certificate-count",
+            [types.principal(university.address)],
+            deployer.address
+        );
+        
+        call.result.expectUint(2);
+    },
+});
+
+Clarinet.test({
+    name: "Complex workflow - complete certificate lifecycle with all features",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get("deployer")!;
+        const university = accounts.get("wallet_1")!;
+        const endorserInst = accounts.get("wallet_2")!;
+        const student = accounts.get("wallet_3")!;
+        const viewer = accounts.get("wallet_4")!;
+        
+        // Step 1: Register institutions
+        let block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "register-institution",
+                [
+                    types.principal(university.address),
+                    types.ascii("Complete Lifecycle University"),
+                    types.ascii("CLU2023")
+                ],
+                deployer.address
+            ),
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "register-institution",
+                [
+                    types.principal(endorserInst.address),
+                    types.ascii("Endorsing Institution"),
+                    types.ascii("EI2023")
+                ],
+                deployer.address
+            )
+        ]);
+        
+        block.receipts[0].result.expectOk().expectBool(true);
+        block.receipts[1].result.expectOk().expectBool(true);
+        
+        // Step 2: Create certificate template
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "create-certificate-template",
+                [
+                    types.ascii("Full Stack Developer Certificate"),
+                    types.list([
+                        types.ascii("Programming Languages"),
+                        types.ascii("Web Development"),
+                        types.ascii("Database Management"),
+                        types.ascii("Software Engineering")
+                    ]),
+                    types.ascii("Must complete all required coursework with GPA >= 3.0")
+                ],
+                deployer.address
+            )
+        ]);
+        
+        const templateId = block.receipts[0].result.expectOk().expectUint(1);
+        
+        // Step 3: Set institution verification levels
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "set-institution-verification-level",
+                [
+                    types.principal(university.address),
+                    types.list([
+                        types.ascii("Regional Accreditation"),
+                        types.ascii("ABET Certified"),
+                        types.ascii("ISO 9001")
+                    ])
+                ],
+                deployer.address
+            )
+        ]);
+        
+        block.receipts[0].result.expectOk().expectBool(true);
+        
+        // Step 4: Issue certificate
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "issue-certificate",
+                [
+                    types.principal(student.address),
+                    types.buff(new Uint8Array(32).fill(123)),
+                    types.ascii("Bachelor of Science"),
+                    types.ascii("Full Stack Development"),
+                    types.uint(20231230),
+                    types.some(types.ascii("complete-workflow-metadata"))
+                ],
+                university.address
+            )
+        ]);
+        
+        const certificateId = block.receipts[0].result.expectOk().expectUint(1);
+        
+        // Step 5: Add comprehensive grades
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "add-certificate-grades",
+                [
+                    types.uint(certificateId),
+                    types.some(types.uint(375)), // 3.75 GPA
+                    types.some(types.ascii("Magna Cum Laude")),
+                    types.some(types.uint(3)), // 3rd in class
+                    types.some(types.uint(145)), // 145 credits
+                    types.list([
+                        types.ascii("Magna Cum Laude"),
+                        types.ascii("Best Senior Project"),
+                        types.ascii("Programming Excellence Award")
+                    ])
+                ],
+                university.address
+            )
+        ]);
+        
+        block.receipts[0].result.expectOk().expectBool(true);
+        
+        // Step 6: Add endorsement
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "endorse-certificate",
+                [types.uint(certificateId)],
+                endorserInst.address
+            )
+        ]);
+        
+        block.receipts[0].result.expectOk().expectBool(true);
+        
+        // Step 7: Grant certificate access
+        block = chain.mineBlock([
+            Tx.contractCall(
+                CONTRACT_NAME,
+                "grant-certificate-access",
+                [
+                    types.uint(certificateId),
+                    types.principal(viewer.address),
+                    types.ascii("view"),
+                    types.some(types.uint(chain.blockHeight + 100)) // Expires in 100 blocks
+                ],
+                university.address
+            )
+        ]);
+        
+        block.receipts[0].result.expectOk().expectBool(true);
+        
+        // Step 8: Perform comprehensive verification
+        let call = await chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "comprehensive-verify",
+            [types.uint(certificateId)],
+            deployer.address
+        );
+        
+        const comprehensiveVerification = call.result.expectOk().expectTuple() as any;
+        comprehensiveVerification["is-valid"].expectBool(true);
+        comprehensiveVerification["verification-score"].expectUint(85); // Should be high score
+        
+        // Step 9: Verify all components work together
+        // Check certificate details
+        call = await chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "verify-certificate",
+            [types.uint(certificateId)],
+            deployer.address
+        );
+        
+        const verification = call.result.expectSome().expectTuple() as any;
+        verification["is-valid"].expectBool(true);
+        verification["student-address"].expectPrincipal(student.address);
+        verification["degree-type"].expectAscii("Bachelor of Science");
+        verification["field-of-study"].expectAscii("Full Stack Development");
+        
+        // Check grades
+        call = await chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-certificate-grades",
+            [types.uint(certificateId)],
+            deployer.address
+        );
+        
+        const grades = call.result.expectSome().expectTuple() as any;
+        grades["gpa"].expectSome().expectUint(375);
+        grades["honors"].expectSome().expectAscii("Magna Cum Laude");
+        grades["rank"].expectSome().expectUint(3);
+        
+        // Check endorsements
+        call = await chain.callReadOnlyFn(
+            CONTRACT_NAME,
+            "get-certificate-endorsements",
+            [types.uint(certificateId)],
+            deployer.address
+        );
+        
+        const endorsements = call.result.expectSome().expectTuple() as any;
+        endorsements["endorsement-count"].expectUint(1);
+        const endorsers = endorsements["endorsers"].expectList();
+        assertEquals(endorsers.length, 1);
+        endorsers[0].expectPrincipal(endorserInst.address);
+        
+        // Final verification: Certificate is fully functional and comprehensive
+        assertEquals(chain.getAssetsMaps().assets, {});
+    },
+});
